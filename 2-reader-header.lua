@@ -84,6 +84,9 @@ local header_defaults = {
     chapter_markers = "none", -- "none", "main", or "all"
     font_size = 14,
     font_bold = false,
+    -- Header font: "ffont" = the built-in KOReader UI font (original behaviour);
+    -- otherwise a TTF path chosen via FontChooser.  Font:getFace accepts both.
+    header_font_face = "ffont",
     custom_texts = {},
     disabled_custom_texts = {},
     custom_separator = " - ",
@@ -138,6 +141,7 @@ local function getHeaderSettings()
     if settings.progress_bar_mode == nil then settings.progress_bar_mode = "book" end
     if settings.font_size == nil then settings.font_size = 14 end
     if settings.font_bold == nil then settings.font_bold = false end
+    if settings.header_font_face == nil then settings.header_font_face = "ffont" end
     if settings.custom_texts == nil then settings.custom_texts = {} end
     if settings.disabled_custom_texts == nil then settings.disabled_custom_texts = {} end
     if settings.hide_icons == nil then settings.hide_icons = {} end
@@ -173,6 +177,7 @@ local function getHeaderSettings()
         chapter_markers = true,
         font_size = true,
         font_bold = true,
+        header_font_face = true,
         custom_texts = true,
         disabled_custom_texts = true,
         custom_separator = true,
@@ -438,6 +443,71 @@ local function createToggleItem(params)
                 UIManager:setDirty(params.reader_ui.dialog, "ui")
             end
         end,
+    }
+end
+
+-- Header font face picker.  "ffont" (default) is the built-in UI-font ALIAS --
+-- it deliberately follows whatever KOReader resolves the interface font to on
+-- this device/build/locale (and any user UI-font override), so it is kept as a
+-- first-class choice rather than pinned to a concrete file.  "Choose a font…"
+-- opens the standard FontChooser for a concrete TTF; Font:getFace accepts
+-- either the alias or a file path.
+local function createHeaderFontFaceMenu(reader_ui)
+    local function currentFace()
+        return getHeaderSettings().header_font_face or "ffont"
+    end
+    local function applyFace(face, touchmenu_instance)
+        local h = getHeaderSettings()
+        if h.header_font_face ~= face then
+            h.header_font_face = face
+            saveHeaderSettings(h)
+        end
+        if touchmenu_instance then touchmenu_instance:updateItems() end
+        if reader_ui and reader_ui.document then
+            UIManager:setDirty(reader_ui.dialog, "ui")
+        end
+    end
+    return {
+        text_func = function()
+            local f = currentFace()
+            if f == "ffont" then return _("Font: built-in (default)") end
+            local FontChooser = require("ui/widget/fontchooser")
+            return T(_("Font: %1"), FontChooser.getFontNameText(f) or f)
+        end,
+        sub_item_table = {
+            {
+                text = _("Built-in UI font (default)"),
+                help_text = _("The header uses KOReader's built-in interface font "
+                    .. "(the 'ffont' alias).  It follows the device/build and any "
+                    .. "UI font you set in KOReader, instead of a fixed file."),
+                checked_func = function() return currentFace() == "ffont" end,
+                callback = function(touchmenu_instance)
+                    applyFace("ffont", touchmenu_instance)
+                end,
+            },
+            {
+                text_func = function()
+                    local f = currentFace()
+                    if f == "ffont" then return _("Choose a font…") end
+                    local FontChooser = require("ui/widget/fontchooser")
+                    return T(_("Font: %1"), FontChooser.getFontNameText(f) or f)
+                end,
+                checked_func = function() return currentFace() ~= "ffont" end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    local FontChooser = require("ui/widget/fontchooser")
+                    local f = currentFace()
+                    UIManager:show(FontChooser:new{
+                        title = _("Header font"),
+                        font_file = (f ~= "ffont") and f or nil,
+                        keep_shown_on_apply = true,
+                        callback = function(file)
+                            applyFace(file, touchmenu_instance)
+                        end,
+                    })
+                end,
+            },
+        },
     }
 end
 
@@ -915,7 +985,7 @@ ReaderView.paintTo = function(self, bb, x, y)
     
     -- ===========================!!!!!!!!!!!!!!!=========================== -
     -- Configure formatting options for header here, if desired (defaults to footer options)
-    local header_font_face = "ffont"
+    local header_font_face = h_settings.header_font_face or "ffont"
     local header_font_size = h_settings.font_size
     local header_font_bold = h_settings.font_bold
     local header_font_color = Blitbuffer.COLOR_BLACK
@@ -1408,8 +1478,17 @@ function ReaderUI:init()
     orig_ReaderUI_init(self)
     setupHeaderTouchZone(self)
     
-    -- Auto-enable header for PDFs/CBZ if auto_background_for_pdf is on
+    -- If a chosen header font file was removed, fall back to the built-in alias.
     local h_settings = getHeaderSettings()
+    if h_settings.header_font_face and h_settings.header_font_face ~= "ffont" then
+        local FontChooser = require("ui/widget/fontchooser")
+        if not FontChooser.isFontRegistered(h_settings.header_font_face) then
+            h_settings.header_font_face = "ffont"
+            saveHeaderSettings(h_settings)
+        end
+    end
+
+    -- Auto-enable header for PDFs/CBZ if auto_background_for_pdf is on
     if h_settings.auto_background_for_pdf and self.document then
         local doc_info = self.document.info
         if doc_info and doc_info.has_pages then
@@ -2252,6 +2331,7 @@ Examples:
                         setting_key = "font_bold",
                         reader_ui = self.ui,
                     },
+                    createHeaderFontFaceMenu(self.ui),
                 },
             },
             {
