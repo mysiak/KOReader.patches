@@ -115,6 +115,9 @@ local header_defaults = {
     separator_top_margin = 4,
     separator_side_margin = 0,
     separator_follow_book_margins = false,
+    -- Reserve page height for the header (reflowable/CRE only): push the page
+    -- text down by the header height instead of drawing the header over it.
+    reserve_height = false,
 }
 
 local function getHeaderSettings()
@@ -160,7 +163,8 @@ local function getHeaderSettings()
     if settings.separator_top_margin == nil then settings.separator_top_margin = 4 end
     if settings.separator_side_margin == nil then settings.separator_side_margin = 0 end
     if settings.separator_follow_book_margins == nil then settings.separator_follow_book_margins = false end
-    
+    if settings.reserve_height == nil then settings.reserve_height = false end
+
     -- Clean up unsupported settings - keep only valid keys
     local valid_keys = {
         enabled = true,
@@ -202,6 +206,7 @@ local function getHeaderSettings()
         separator_top_margin = true,
         separator_side_margin = true,
         separator_follow_book_margins = true,
+        reserve_height = true,
     }
     
     local cleaned = false
@@ -226,6 +231,66 @@ end
 
 local function isHeaderEnabled()
     return getHeaderSettings().enabled
+end
+
+-- =========================================================================
+-- Reserve page height for the header
+-- =========================================================================
+-- By default the header is drawn OVER the page (ReaderView.paintTo below paints
+-- it after the page).  With reserve_height on, we push the reflowable text down
+-- by the header height, mirroring how the core reserves the footer height in
+-- ReaderTypeset:onSetPageMargins (it adds footer:getHeight() to the BOTTOM
+-- margin) -- here we add the header height to the TOP margin.
+--
+-- KNOWN LIMITATION: an EPUB cover is rendered by crengine as a full-bleed
+-- image that ignores the text page margins, so it still slides under the
+-- header (exactly as it slides under the native footer -- same crengine
+-- behaviour, not specific to this reserve).  Text and all subsequent pages
+-- honour the reserve; only the cover page is affected.
+--
+-- _header_reserve_height holds the exact height measured by the last paintTo;
+-- estimateHeaderHeight() is only a pre-first-paint fallback.
+local _header_reserve_height = 0
+local _header_reserve_reapply_scheduled = false
+
+local function estimateHeaderHeight(s)
+    local face = Font:getFace("ffont", s.font_size or 14)
+    local line_h = (face and face.size and face.size) or Screen:scaleBySize(16)
+    local h = line_h + Screen:scaleBySize(s.header_top_margin or 2)
+    if s.show_progress_bar then
+        h = h + Screen:scaleBySize(s.header_bottom_margin or 2)
+            + Screen:scaleBySize(s.progress_bar_height or 3)
+    end
+    return h
+end
+
+-- Height (px) to reserve at the top of the page, or 0 when off.
+local function getHeaderReserveHeight()
+    local s = getHeaderSettings()
+    if not s.enabled or not s.reserve_height then return 0 end
+    if _header_reserve_height > 0 then return _header_reserve_height end
+    return estimateHeaderHeight(s)
+end
+
+-- Re-apply the current book's page margins so a reserve change takes effect now.
+-- Routes through ReaderTypeset:onSetPageMargins -> CreDocument:setPageMargins
+-- (hooked below) -> UpdatePos, the same path the core uses for margin changes.
+local function reapplyReserveMargins(reader_ui)
+    if reader_ui and reader_ui.typeset and reader_ui.typeset.onSetPageMargins
+            and reader_ui.typeset.unscaled_margins then
+        reader_ui.typeset:onSetPageMargins(reader_ui.typeset.unscaled_margins)
+    elseif reader_ui and reader_ui.dialog then
+        UIManager:setDirty(reader_ui.dialog, "ui")
+    end
+end
+
+-- Hook the reflowable margin setter to add the reserved header height to TOP.
+-- CRE only: paged docs (KoptDocument) go through a different setter, so they
+-- are untouched.
+local CreDocument = require("document/credocument")
+local _CreDoc_setPageMargins_orig = CreDocument.setPageMargins
+CreDocument.setPageMargins = function(self, left, top, right, bottom)
+    return _CreDoc_setPageMargins_orig(self, left, top + getHeaderReserveHeight(), right, bottom)
 end
 
 -- Detect if night mode is active
@@ -437,6 +502,27 @@ local function createToggleItem(params)
             if params.reader_ui and params.reader_ui.document then
                 UIManager:setDirty(params.reader_ui.dialog, "ui")
             end
+        end,
+    }
+end
+
+-- Like createToggleItem, but re-applies the page margins on change so the
+-- reserved header space appears/disappears immediately on the current book.
+local function createReserveToggleItem(reader_ui)
+    return {
+        text = _("Reserve page space for header"),
+        help_text = _("When on, the page text starts below the header instead of "
+            .. "being drawn under it.  Reflowable books (EPUB/FB2) only; paged "
+            .. "documents (PDF/CBZ) are unaffected."),
+        checked_func = function()
+            return getHeaderSettings().reserve_height
+        end,
+        callback = function(touchmenu_instance)
+            local h_settings = getHeaderSettings()
+            h_settings.reserve_height = not h_settings.reserve_height
+            saveHeaderSettings(h_settings)
+            touchmenu_instance:updateItems()
+            reapplyReserveMargins(reader_ui)
         end,
     }
 end
@@ -1294,7 +1380,23 @@ ReaderView.paintTo = function(self, bb, x, y)
     if show_progress_bar then
         total_height = total_height + progress_bar_margin + progress_bar_height
     end
-    
+
+    -- Feed the exact measured height back to the reserve so the text sits just
+    -- below the header.  When it changes (first paint, or a settings change),
+    -- re-apply the page margins ONCE on the next tick; the height is independent
+    -- of the margins, so this converges in a single re-render (no loop).
+    if h_settings.reserve_height and total_height ~= _header_reserve_height then
+        _header_reserve_height = total_height
+        if not _header_reserve_reapply_scheduled and self.ui and self.ui.typeset then
+            _header_reserve_reapply_scheduled = true
+            local ui = self.ui
+            UIManager:nextTick(function()
+                _header_reserve_reapply_scheduled = false
+                reapplyReserveMargins(ui)
+            end)
+        end
+    end
+
     -- Check if background should be drawn
     local background_enabled = h_settings.background_enabled
     
@@ -2231,6 +2333,11 @@ Examples:
             createItemsSelector(),
             createReorderMenu(),
             createSeparatorStyleSelector(),
+            (function()
+                local item = createReserveToggleItem(self.ui)
+                item.separator = true
+                return item
+            end)(),
             {
                 text = _("Font settings"),
                 separator = true,
