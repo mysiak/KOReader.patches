@@ -40,7 +40,7 @@ MENU:
 File Manager → File manager settings → "Page count standard" to switch between standards
 
 REQUIREMENTS:
-- Cover Browser or Project title plugin enabled
+- Cover Browser or Project title or ZenOS plugin enabled
 - Grid/mosaic view mode
 
 ================================================================================
@@ -461,6 +461,136 @@ local function patchCoverBrowserPageCount(plugin)
 end
 
 --------------------------------------------------------------------------------
+-- ZenOS Badge Patch (Zen Mosaic View)
+--------------------------------------------------------------------------------
+local function patchZenosPageCount(plugin)
+    local function patchZenMosaicMenu(MosaicMenu)
+        if type(MosaicMenu) ~= "table" then
+            return false
+        end
+
+        local ZenMosaicItem = MosaicMenu._zen_mosaic_item_class
+        if type(ZenMosaicItem) ~= "table" or type(ZenMosaicItem.paintTo) ~= "function" then
+            return false
+        end
+
+        if ZenMosaicItem.patched_pages_badge_zenos then
+            return true
+        end
+        ZenMosaicItem.patched_pages_badge_zenos = true
+
+        local origZenMosaicItemPaintTo = ZenMosaicItem.paintTo
+        function ZenMosaicItem:paintTo(bb, x, y)
+            origZenMosaicItemPaintTo(self, bb, x, y)
+
+            if self.file_deleted or not self._zen_is_book then
+                return
+            end
+
+            local frame = self._zen_cover_frame
+            if not frame or not frame.dimen then
+                return
+            end
+
+            local is_completed = self._zen_effective_status == "complete" or self.status == "complete"
+
+            local page_count, is_estimated, estimate_for_accurate
+            if self.filepath then
+                page_count, is_estimated, estimate_for_accurate = getPageCount(self.filepath)
+            end
+
+            if not page_count then
+                return
+            end
+
+            local page_text
+            local checkmark = ""
+
+            if is_completed and show_checkmark then
+                checkmark = "✓ "
+            end
+
+            if is_estimated then
+                page_text = checkmark .. "~" .. page_count .. "p"
+            else
+                local hide_rendered = getHideRenderedPages()
+                if estimate_for_accurate and estimate_for_accurate ~= page_count then
+                    if hide_rendered then
+                        page_text = checkmark .. "~" .. estimate_for_accurate .. "p"
+                    else
+                        page_text = checkmark .. "~" .. estimate_for_accurate .. "p (" .. page_count .. "p)"
+                    end
+                else
+                    page_text = checkmark .. page_count .. "p"
+                end
+            end
+
+            local corner_mark_size = Screen:scaleBySize(10)
+            local font_size = math.floor(corner_mark_size * page_font_size)
+
+            local pages_text = TextWidget:new({
+                text = page_text,
+                face = Font:getFace("cfont", font_size),
+                alignment = "left",
+                fgcolor = page_text_color,
+                bold = true,
+                padding = 2,
+            })
+
+            local badge_bg = is_completed and completed_background_color or background_color
+
+            local pages_badge = FrameContainer:new({
+                linesize = Screen:scaleBySize(2),
+                radius = Screen:scaleBySize(border_corner_radius),
+                color = border_color,
+                bordersize = border_thickness,
+                background = badge_bg,
+                padding = Screen:scaleBySize(2),
+                margin = 0,
+                pages_text,
+            })
+
+            local pad = Screen:scaleBySize(move_from_border)
+            local badge_h = pages_badge:getSize().h
+            local pos_x_badge = frame.dimen.x + pad
+            local pos_y_badge = frame.dimen.y + frame.dimen.h - (pad + badge_h)
+            pages_badge:paintTo(bb, pos_x_badge, pos_y_badge)
+        end
+
+        logger.info("Page badge patch: ZenOS mosaic items patched")
+        return true
+    end
+
+    local function tryPatchLoadedMosaicMenu()
+        local MosaicMenu = package.loaded["mosaicmenu"]
+        if not MosaicMenu then
+            return false
+        end
+        return patchZenMosaicMenu(MosaicMenu)
+    end
+
+    if tryPatchLoadedMosaicMenu() then
+        return
+    end
+
+    local UIManager = require("ui/uimanager")
+    local attempts = 0
+    local max_attempts = 40
+
+    local function deferredPatch()
+        attempts = attempts + 1
+        if tryPatchLoadedMosaicMenu() then
+            return
+        end
+        if attempts < max_attempts then
+            UIManager:scheduleIn(0.5, deferredPatch)
+        end
+    end
+
+    UIManager:scheduleIn(0.1, deferredPatch)
+end
+
+--------------------------------------------------------------------------------
 -- File Manager Menu Integration
 --------------------------------------------------------------------------------
 local FileManagerMenu = require("apps/filemanager/filemanagermenu")
@@ -574,4 +704,7 @@ Within ±15%: ]] .. ACCURACY_WITHIN_15PCT .. [[%
     orig_FileManagerMenu_setUpdateItemTable(self)
 end
 
+userpatch.registerPatchPluginFunc("projecttitle", patchCoverBrowserPageCount)
 userpatch.registerPatchPluginFunc("coverbrowser", patchCoverBrowserPageCount)
+userpatch.registerPatchPluginFunc("zenos", patchZenosPageCount)
+userpatch.registerPatchPluginFunc("zen_ui", patchZenosPageCount)
